@@ -1,0 +1,197 @@
+﻿using System;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+import socket
+import ssl
+import json
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
+from cryptography.hazmat.primitives.asymmetric import utils as asym_utils
+from cryptography.hazmat.primitives import hashes
+from datetime import datetime
+import os
+
+# =============== Certificate Authority (CA) ===============
+def generate_ca_keys():
+    """Generates and stores CA's private and public keys."""
+    ca_private_key = ec.generate_private_key(ec.SECP384R1())
+    ca_public_key = ca_private_key.public_key()
+
+    # Save CA private key to file
+    with open("ca_private_key.pem", "wb") as f:
+        f.write(
+            ca_private_key.private_bytes(
+                encoding = serialization.Encoding.PEM,
+                format = serialization.PrivateFormat.PKCS8,
+                encryption_algorithm = serialization.NoEncryption(),
+            )
+        )
+
+    # Save CA public key to file
+    with open("ca_public_key.pem", "wb") as f:
+        f.write(
+            ca_public_key.public_bytes(
+                encoding = serialization.Encoding.PEM,
+                format = serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+    return ca_private_key, ca_public_key
+
+def issue_certificate(ca_private_key, entity_public_key):
+    """Signs and issues a certificate for a given public key."""
+    signed_data = ca_private_key.sign(
+        entity_public_key.public_bytes(
+            encoding = serialization.Encoding.PEM,
+            format = serialization.PublicFormat.SubjectPublicKeyInfo,
+        ),
+        ec.ECDSA(hashes.SHA256()),
+    )
+    return {
+    "public_key": entity_public_key.public_bytes(
+        encoding = serialization.Encoding.PEM,
+        format = serialization.PublicFormat.SubjectPublicKeyInfo,
+
+    ).decode(),
+        "signature": signed_data.hex(),
+    }
+
+def verify_certificate(ca_public_key, certificate):
+    """Verifies the validity of a certificate using CA's public key."""
+    try:
+        entity_public_key = serialization.load_pem_public_key(
+            certificate["public_key"].encode()
+        )
+        ca_public_key.verify(
+            bytes.fromhex(certificate["signature"]),
+            certificate["public_key"].encode(),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return True, entity_public_key
+    except Exception as e:
+        print("Certificate verification failed:", e)
+        return False, None
+
+# =============== Client-Server Key Exchange ===============
+def generate_key_pair():
+    """Generates an ephemeral key pair for ECDHE."""
+    private_key = ec.generate_private_key(ec.SECP384R1())
+    return private_key, private_key.public_key()
+
+def derive_shared_secret(private_key, peer_public_key):
+    """Derives a shared secret using ECDHE."""
+    shared_secret = private_key.exchange(ec.ECDH(), peer_public_key)
+    return HKDF(
+        algorithm = hashes.SHA256(),
+        length = 32,
+        salt = None,
+        info = b"handshake data",
+    ).derive(shared_secret)
+
+def secure_channel(shared_secret):
+    """Returns an AES-GCM cipher using the shared secret."""
+    return AESGCM(shared_secret), os.urandom(12)  # Random nonce
+
+# =============== Message Exchange ===============
+def sign_message(private_key, message):
+    """Signs a message with ECDSA."""
+    return private_key.sign(
+message.encode(),
+        ec.ECDSA(hashes.SHA256()),
+    ).hex()
+
+def verify_message_signature(public_key, message, signature):
+    """Verifies a message's signature."""
+    try:
+        public_key.verify(
+            bytes.fromhex(signature),
+            message.encode(),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return True
+    except Exception as e:
+        print("Signature verification failed:", e)
+        return False
+
+def timestamp_message(message):
+    """Adds a timestamp to a message."""
+    return json.dumps({ "message": message, "timestamp": datetime.utcnow().isoformat()})
+
+def validate_timestamp(message_data):
+    """Validates the timestamp for replay protection."""
+    now = datetime.utcnow()
+    timestamp = datetime.fromisoformat(message_data["timestamp"])
+    return (now - timestamp).total_seconds() < 60  # Within 60 seconds
+
+# =============== Example Communication Logic ===============
+def client_server_handshake():
+    """Demonstrates a secure handshake and message exchange between client and server."""
+    # Generate ephemeral key pairs for handshake
+    client_private_key, client_public_key = generate_key_pair()
+    server_private_key, server_public_key = generate_key_pair()
+
+    # Derive shared secret for secure communication
+    client_shared_secret = derive_shared_secret(client_private_key, server_public_key)
+    server_shared_secret = derive_shared_secret(server_private_key, client_public_key)
+
+    # Verify shared secrets match
+    assert client_shared_secret == server_shared_secret, "Shared secrets do not match!"
+
+    # Initialize secure channels (AES-GCM)
+    client_cipher, client_nonce = secure_channel(client_shared_secret)
+    server_cipher, server_nonce = secure_channel(server_shared_secret)
+
+    # Simulate message exchange
+    original_message = "Hello, Server!"
+
+    # Client signs and timestamps the message
+    signed_message = sign_message(client_private_key, original_message)
+    timestamped_message = timestamp_message(original_message)
+
+    # Encrypt the message
+    encrypted_message = client_cipher.encrypt(client_nonce, timestamped_message.encode(), None)
+
+    print("Client sent encrypted message.")
+
+    # Server decrypts the message
+    decrypted_message = server_cipher.decrypt(client_nonce, encrypted_message, None).decode()
+    message_data = json.loads(decrypted_message)
+
+    # Validate message integrity and signature
+    if validate_timestamp(message_data):
+        print("Timestamp is valid.")
+    else:
+        print("Message timestamp invalid (possible replay attack).")
+
+    is_valid_signature = verify_message_signature(
+        client_public_key, message_data["message"], signed_message
+    )
+    if is_valid_signature:
+        print("Signature verified. Message is authentic.")
+    else:
+        print("Signature verification failed. Message may be tampered.")
+
+    print("Decrypted message:", message_data["message"])
+
+# =============== Main Logic ===============
+# (1) Initialize CA and create keys
+ca_private_key, ca_public_key = generate_ca_keys()
+
+# (2) Generate keys for Client and Server
+client_private_key, client_public_key = generate_key_pair()
+server_private_key, server_public_key = generate_key_pair()
+
+# (3) Issue certificates
+client_certificate = issue_certificate(ca_private_key, client_public_key)
+server_certificate = issue_certificate(ca_private_key, server_public_key)
+
+# Example Verification
+print("Client Certificate Verified:", verify_certificate(ca_public_key, client_certificate))
+print("Server Certificate Verified:", verify_certificate(ca_public_key, server_certificate))
+
+# Simulate client-server handshake and message exchange
+client_server_handshake()
+
